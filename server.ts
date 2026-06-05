@@ -24,6 +24,60 @@ const CHROME_UA =
 const errMessage = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 const asBuffer = (b: Buffer | string): Buffer => (typeof b === "string" ? Buffer.from(b, "utf8") : b);
 
+// Request headers we never forward to the target. The UA is always replaced with
+// CHROME_UA (the whole point of the proxy); `host`/`content-length` are recomputed
+// by fetch from the target URL and body; `authorization` is the proxy's OWN bearer
+// token (see the auth guard) — forwarding it would leak our credential to every
+// target; `accept-encoding` is dropped so fetch negotiates compression and we return
+// already-decoded bytes; the rest are hop-by-hop or proxy/CDN trace headers that
+// describe the proxy hop, not the caller's request.
+const STRIPPED_REQUEST_HEADERS = new Set([
+  "host",
+  "user-agent",
+  "authorization",
+  "content-length",
+  "accept-encoding",
+  "connection",
+  "keep-alive",
+  "proxy-authenticate",
+  "proxy-authorization",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "upgrade",
+  "cf-connecting-ip",
+  "cf-ray",
+  "cf-ipcountry",
+  "cf-visitor",
+  "cdn-loop",
+  "x-forwarded-for",
+  "x-forwarded-host",
+  "x-forwarded-proto",
+  "x-forwarded-port",
+  "x-real-ip",
+  "forwarded",
+]);
+
+/** Forward the caller's request headers to the target, minus the proxy-hop headers
+ *  in STRIPPED_REQUEST_HEADERS. Callers add the UA separately so CHROME_UA always wins. */
+function forwardableHeaders(req: Request): Record<string, string> {
+  const headers: Record<string, string> = {};
+  req.headers.forEach((value, key) => {
+    if (!STRIPPED_REQUEST_HEADERS.has(key.toLowerCase())) headers[key] = value;
+  });
+  return headers;
+}
+
+/** Primary locale + ordered language list from an Accept-Language header, used to make
+ *  the stealth browser present the caller's languages instead of a fixed default. */
+function parseAcceptLanguage(header: string | null): { locale: string; languages: string[] } | null {
+  const langs = (header ?? "")
+    .split(",")
+    .map((part) => part.split(";")[0].trim())
+    .filter((tag) => tag && tag !== "*");
+  return langs.length ? { locale: langs[0], languages: langs } : null;
+}
+
 // Common anti-bot interstitials across vendors (Cloudflare, Akamai, PerimeterX/HUMAN,
 // Imperva/Incapsula, generic captcha/JS walls). Used to decide whether a tier's
 // response is worth escalating past.
@@ -206,7 +260,7 @@ async function handleProxy(req: Request, query: ProxyQuery, body?: Buffer): Prom
     console.log(`-> RENDER ${url}`);
     try {
       const waitMs = Math.min(Number(query.wait) || 6000, 30000);
-      const rendered = await renderStealth(url, waitMs, block);
+      const rendered = await renderStealth(url, req, waitMs, block);
       console.log(`<- ${rendered.status} ${url} (render)`);
       return buildResponse(rendered.status, rendered.body, rendered.contentType, wantMd, url);
     } catch (e) {
@@ -216,19 +270,18 @@ async function handleProxy(req: Request, query: ProxyQuery, body?: Buffer): Prom
   }
 
   // Mirror the caller's method/body so form POSTs (not just GET fetches) can be
-  // proxied. Content-Type is the one request header we forward — the UA is always
-  // replaced with CHROME_UA, which is the whole point of the proxy.
+  // proxied, and forward their request headers (language, cookies, referer, …) so the
+  // target sees the real request — minus the proxy-hop headers in
+  // STRIPPED_REQUEST_HEADERS and the UA, which is always replaced with CHROME_UA.
   const method = req.method || "GET";
   const reqBody = method === "GET" || method === "HEAD" ? undefined : body;
-  const contentType = req.headers.get("content-type");
 
   console.log(`-> ${method} ${url}`);
   try {
     // Step 1: plain fetch with a Chrome UA. Handles the common cases (datacenter-IP
     // blocks, broken TLS chains, anti-bot heuristics that only check headers). TLS
     // verification is disabled per-request to tolerate incomplete certificate chains.
-    const upstreamHeaders: Record<string, string> = { "User-Agent": CHROME_UA };
-    if (reqBody && contentType) upstreamHeaders["content-type"] = contentType;
+    const upstreamHeaders = { ...forwardableHeaders(req), "User-Agent": CHROME_UA };
     const direct = await fetch(url, {
       method,
       headers: upstreamHeaders,
@@ -276,7 +329,7 @@ async function handleProxy(req: Request, query: ProxyQuery, body?: Buffer): Prom
     if (auto && looksBlocked(best.status, asBuffer(best.body))) {
       console.log(`?? auto fallback on ${method} ${url} — via stealth render`);
       try {
-        const rendered = await renderStealth(url, 6000, block);
+        const rendered = await renderStealth(url, req, 6000, block);
         if (!looksBlocked(rendered.status, asBuffer(rendered.body))) {
           console.log(`<- ${rendered.status} ${url} (auto render)`);
           return buildResponse(rendered.status, rendered.body, rendered.contentType, wantMd, url);
@@ -311,22 +364,31 @@ async function getBrowser(): Promise<Browser> {
 
 async function renderStealth(
   url: string,
+  req: Request,
   waitMs: number,
   block = true,
 ): Promise<{ status: number; body: string; contentType: string }> {
   const browser = await getBrowser();
-  const ctx = await browser.newContext({
+  // Honor the caller's Accept-Language so the rendered page — and its navigator.languages
+  // tell — matches what a direct fetch would send; fall back to the German default. Only
+  // language is derived here: unlike the single-shot fetch, a browser context broadcasts
+  // its headers to every subresource origin, so we don't forward cookies/referer wholesale.
+  const lang = parseAcceptLanguage(req.headers.get("accept-language")) ?? {
     locale: "de-DE",
+    languages: ["de-DE", "de", "en"],
+  };
+  const ctx = await browser.newContext({
+    locale: lang.locale,
     timezoneId: "Europe/Berlin",
     viewport: { width: 1440, height: 900 },
     userAgent: CHROME_UA,
   });
-  await ctx.addInitScript(() => {
+  await ctx.addInitScript((languages: string[]) => {
     Object.defineProperty(navigator, "webdriver", { get: () => undefined });
-    Object.defineProperty(navigator, "languages", { get: () => ["de-DE", "de", "en"] });
+    Object.defineProperty(navigator, "languages", { get: () => languages });
     Object.defineProperty(navigator, "plugins", { get: () => [1, 2, 3, 4, 5] });
     (window as unknown as { chrome: unknown }).chrome = { runtime: {} };
-  });
+  }, lang.languages);
   const page = await ctx.newPage();
   await enableBlocking(page, block);
   try {

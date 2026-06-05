@@ -77,8 +77,14 @@ Content-Type: application/x-www-form-urlencoded
 field=value&other=value
 ```
 
-`Content-Type` is the only request header forwarded; the `User-Agent` is
-always replaced with a Chrome UA (the reason callers reach for the proxy).
+Your request headers (e.g. `Accept-Language`, `Cookie`, `Referer`, `Content-Type`)
+are forwarded to the target. Exceptions: the `User-Agent` is always replaced with a
+Chrome UA (the reason callers reach for the proxy); `Authorization` is dropped (it's
+the proxy's own bearer token, not a credential for the target); and `Host`,
+`Accept-Encoding`, hop-by-hop headers, and proxy/CDN trace headers (`X-Forwarded-*`,
+`CF-*`, …) are stripped. On the `render=1` path only `Accept-Language` is honored (it
+sets the browser locale), since a browser context would otherwise broadcast headers
+like `Cookie` to every subresource origin.
 
 ### Query parameters
 
