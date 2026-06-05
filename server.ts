@@ -240,16 +240,16 @@ async function handleProxy(req: Request, query: ProxyQuery, body?: Buffer): Prom
       contentType: direct.headers.get("content-type") || "text/html",
     };
 
-    // Tier 2 — FlareSolverr. Fires on the cheap CF fingerprint or a forced `solve=1`
-    // (original behaviour), and additionally for any blocked-looking response when
-    // auto-escalation is on. CF challenge fingerprint: 403/503 + a small HTML page
-    // containing "Just a moment…" or the cf-chl_ JS-init markers.
+    // Tier 2 — FlareSolverr, the Cloudflare *challenge* solver. Fires only on the
+    // CF fingerprint or a forced `solve=1` — NOT on every auto-escalation block.
+    // FlareSolverr returns the browser-rendered DOM, which for a non-HTML resource
+    // (XML sitemap, JSON API) is Chromium's pretty-printer wrapper, not the original
+    // document; generic blocks therefore fall through to tier-3 stealth render,
+    // which passes non-HTML through raw. CF fingerprint: 403/503 + a small HTML page
+    // with "Just a moment…" or the cf-chl_ JS-init markers.
     const cfChallenge = looksLikeCfChallenge(direct.status, directBody);
-    if (
-      FLARESOLVERR_URL &&
-      (forceSolve || cfChallenge || (auto && looksBlocked(direct.status, directBody)))
-    ) {
-      const reason = forceSolve ? "forced solve" : cfChallenge ? "CF challenge" : "auto fallback";
+    if (FLARESOLVERR_URL && (forceSolve || cfChallenge)) {
+      const reason = forceSolve ? "forced solve" : "CF challenge";
       console.log(`?? ${reason} on ${method} ${url} — via FlareSolverr`);
       const solved = await solveWithFlareSolverr(url, method, reqBody);
       if (solved) {
