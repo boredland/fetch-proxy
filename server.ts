@@ -12,11 +12,33 @@ const PORT = Number(process.env.PORT || 3000);
 // docker-compose.yml in this directory.
 const FLARESOLVERR_URL = process.env.FLARESOLVERR_URL || "";
 const FLARESOLVERR_TIMEOUT_MS = Number(process.env.FLARESOLVERR_TIMEOUT_MS || 60000);
+// When on, every request auto-escalates (plain -> FlareSolverr -> stealth render)
+// if a tier comes back looking blocked. Callers can still override per-request
+// with `?auto=1` / `?auto=0`.
+const AUTO_FALLBACK = process.env.AUTO_FALLBACK === "1";
 
 const CHROME_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36";
 
 const errMessage = (e: unknown): string => (e instanceof Error ? e.message : String(e));
+const asBuffer = (b: Buffer | string): Buffer => (typeof b === "string" ? Buffer.from(b, "utf8") : b);
+
+// Common anti-bot interstitials across vendors (Cloudflare, Akamai, PerimeterX/HUMAN,
+// Imperva/Incapsula, generic captcha/JS walls). Used to decide whether a tier's
+// response is worth escalating past.
+const BOT_WALL =
+  /just a moment|attention required|cf-chl|__cf_chl|access denied|pardon our interruption|enable javascript (and cookies|to continue)|request unsuccessful\. incapsula|are you (a )?human|verify you are (a )?human|unusual traffic|please verify you|recaptcha|hcaptcha/i;
+
+/** Heuristic for "this response is a block/challenge, not the real page" — drives
+ *  auto-escalation. Conservative on purpose: hard block statuses always count, and
+ *  vendor wall markers only count on a small body (real content pages that merely
+ *  mention "captcha" are large and pass through). A 404 is a real answer, not a
+ *  block, so it does not escalate. */
+function looksBlocked(status: number, body: Buffer): boolean {
+  if (status === 403 || status === 429 || status === 503) return true;
+  if (body.length > 50_000) return false;
+  return BOT_WALL.test(body.subarray(0, 16_384).toString("utf8"));
+}
 
 /** Build the upstream passthrough response, converting to Markdown when the
  *  caller asked for it and the payload is actually HTML (non-HTML bodies — JSON,
@@ -73,6 +95,13 @@ const ProxyQuery = t.Object({
       examples: ["md"],
     }),
   ),
+  auto: t.Optional(
+    t.String({
+      description:
+        'Set to "1" to auto-escalate when a response looks blocked: plain fetch -> FlareSolverr -> stealth render, returning the first tier that is not blocked. "0" opts out when AUTO_FALLBACK is on by default.',
+      examples: ["1"],
+    }),
+  ),
 });
 type ProxyQuery = typeof ProxyQuery.static;
 
@@ -109,7 +138,8 @@ const app = new Elysia()
             summary: "Proxy-fetch a URL",
             description:
               "Fetches `?url=` with a Chrome UA (TLS verification off). Falls back to FlareSolverr on a " +
-              "Cloudflare challenge, or to a stealth Chromium render with `?render=1`.",
+              "Cloudflare challenge, or to a stealth Chromium render with `?render=1`. With `?auto=1` it " +
+              "auto-escalates plain -> FlareSolverr -> render until a tier returns something that is not blocked.",
           },
         })
         .post(
@@ -150,6 +180,9 @@ async function handleProxy(req: Request, query: ProxyQuery, body?: Buffer): Prom
   // `format=md` converts whatever HTML we end up with (direct, FlareSolverr, or
   // rendered) into Markdown — see buildResponse.
   const wantMd = query.format === "md";
+  // Auto-escalation: on by default if AUTO_FALLBACK is set, unless `?auto=0`; or
+  // opt in per-request with `?auto=1`.
+  const auto = query.auto === "1" || (AUTO_FALLBACK && query.auto !== "0");
   if (!url) return Response.json({ error: "?url= parameter required" }, { status: 400 });
 
   if (render) {
@@ -188,29 +221,57 @@ async function handleProxy(req: Request, query: ProxyQuery, body?: Buffer): Prom
     });
     const directBody = Buffer.from(await direct.arrayBuffer());
 
-    // Step 2: if the response is a Cloudflare interactive challenge AND FlareSolverr
-    // is available, retry through it. CF challenge fingerprint: 403/503 + a small HTML
-    // page containing "Just a moment…" or the cf-chl_ JS-init markers.
-    if (FLARESOLVERR_URL && (forceSolve || looksLikeCfChallenge(direct.status, directBody))) {
-      console.log(
-        `?? ${forceSolve ? "forced solve" : "CF challenge"} on ${method} ${url} — via FlareSolverr`,
-      );
+    // Best result so far. Each tier below only replaces it on success, so if every
+    // escalation also comes back blocked we still return the real upstream response
+    // rather than hiding it behind a maintenance/fallback page.
+    let best: { status: number; body: Buffer | string; contentType: string } = {
+      status: direct.status,
+      body: directBody,
+      contentType: direct.headers.get("content-type") || "text/html",
+    };
+
+    // Tier 2 — FlareSolverr. Fires on the cheap CF fingerprint or a forced `solve=1`
+    // (original behaviour), and additionally for any blocked-looking response when
+    // auto-escalation is on. CF challenge fingerprint: 403/503 + a small HTML page
+    // containing "Just a moment…" or the cf-chl_ JS-init markers.
+    const cfChallenge = looksLikeCfChallenge(direct.status, directBody);
+    if (
+      FLARESOLVERR_URL &&
+      (forceSolve || cfChallenge || (auto && looksBlocked(direct.status, directBody)))
+    ) {
+      const reason = forceSolve ? "forced solve" : cfChallenge ? "CF challenge" : "auto fallback";
+      console.log(`?? ${reason} on ${method} ${url} — via FlareSolverr`);
       const solved = await solveWithFlareSolverr(url, method, reqBody);
       if (solved) {
-        console.log(`<- ${solved.status} ${url} (flaresolverr)`);
-        return buildResponse(solved.status, solved.body, "text/html; charset=utf-8", wantMd, url);
+        best = { status: solved.status, body: solved.body, contentType: "text/html; charset=utf-8" };
+        if (!looksBlocked(solved.status, asBuffer(solved.body))) {
+          console.log(`<- ${solved.status} ${url} (flaresolverr)`);
+          return buildResponse(best.status, best.body, best.contentType, wantMd, url);
+        }
+        console.warn(`!! FlareSolverr still blocked ${url}`);
+      } else {
+        console.warn(`!! FlareSolverr failed to solve ${url}`);
       }
-      console.warn(`!! FlareSolverr failed to solve ${url}; returning original 403`);
     }
 
-    console.log(`<- ${direct.status} ${url}`);
-    return buildResponse(
-      direct.status,
-      directBody,
-      direct.headers.get("content-type") || "text/html",
-      wantMd,
-      url,
-    );
+    // Tier 3 — stealth render. Last resort when auto-escalation is on and we still
+    // look blocked (e.g. a non-CF bot wall, or no FlareSolverr sidecar configured).
+    if (auto && looksBlocked(best.status, asBuffer(best.body))) {
+      console.log(`?? auto fallback on ${method} ${url} — via stealth render`);
+      try {
+        const rendered = await renderStealth(url, 6000);
+        if (!looksBlocked(rendered.status, asBuffer(rendered.body))) {
+          console.log(`<- ${rendered.status} ${url} (auto render)`);
+          return buildResponse(rendered.status, rendered.body, "text/html; charset=utf-8", wantMd, url);
+        }
+        console.warn(`!! stealth render still blocked ${url}`);
+      } catch (e) {
+        console.warn(`!! auto render failed ${url}: ${errMessage(e)}`);
+      }
+    }
+
+    console.log(`<- ${best.status} ${url}`);
+    return buildResponse(best.status, best.body, best.contentType, wantMd, url);
   } catch (e) {
     console.error(`!! ${url}: ${errMessage(e)}`);
     return Response.json({ error: errMessage(e) }, { status: 502 });
