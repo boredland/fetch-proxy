@@ -2,12 +2,17 @@
   "name": "fetch-proxy",
   "version": "0.0.1",
   "type": "module",
-  "module": "server.js",
+  "module": "server.ts",
   "scripts": {
-    "dev": "bun --watch server.js",
-    "start": "bun server.js"
+    "dev": "bun --watch server.ts",
+    "start": "bun server.ts",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "playwright-core": "1.60.0"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.14",
+    "typescript": "^6.0.3"
   }
 }

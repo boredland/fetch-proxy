@@ -1,3 +1,4 @@
+import type { Browser } from "playwright-core";
 import { chromium } from "playwright-core";
 
 const AUTH_TOKEN = process.env.AUTH_TOKEN || "";
@@ -12,14 +13,15 @@ const FLARESOLVERR_TIMEOUT_MS = Number(process.env.FLARESOLVERR_TIMEOUT_MS || 60
 const CHROME_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36";
 
-const json = (status, obj) => Response.json(obj, { status });
+const json = (status: number, obj: unknown): Response => Response.json(obj, { status });
+const errMessage = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
 Bun.serve({
   port: PORT,
   // The ?render=1 path drives a real Chromium (goto up to 45s + settle up to
   // 30s), well past Bun's 10s default. Hold connections open long enough for it.
   idleTimeout: 180,
-  async fetch(req) {
+  async fetch(req: Request): Promise<Response> {
     if (AUTH_TOKEN && req.headers.get("authorization") !== `Bearer ${AUTH_TOKEN}`) {
       return json(401, { error: "unauthorized" });
     }
@@ -49,8 +51,8 @@ Bun.serve({
           headers: { "content-type": "text/html; charset=utf-8" },
         });
       } catch (e) {
-        console.error(`!! render ${url}: ${e.message}`);
-        return json(502, { error: e.message });
+        console.error(`!! render ${url}: ${errMessage(e)}`);
+        return json(502, { error: errMessage(e) });
       }
     }
 
@@ -69,7 +71,7 @@ Bun.serve({
       // (datacenter-IP blocks, broken TLS chains, anti-bot heuristics that
       // only check headers). TLS verification is disabled per-request to
       // tolerate servers with incomplete certificate chains.
-      const upstreamHeaders = { "User-Agent": CHROME_UA };
+      const upstreamHeaders: Record<string, string> = { "User-Agent": CHROME_UA };
       if (reqBody && contentType) upstreamHeaders["content-type"] = contentType;
       const direct = await fetch(url, {
         method,
@@ -105,8 +107,8 @@ Bun.serve({
         headers: { "content-type": direct.headers.get("content-type") || "text/html" },
       });
     } catch (e) {
-      console.error(`!! ${url}: ${e.message}`);
-      return json(502, { error: e.message });
+      console.error(`!! ${url}: ${errMessage(e)}`);
+      return json(502, { error: errMessage(e) });
     }
   },
 });
@@ -118,8 +120,8 @@ if (FLARESOLVERR_URL) console.log(`flaresolverr sidecar: ${FLARESOLVERR_URL}`);
 // A shared headless Chromium that masks the standard automation tells. Some sites
 // (e.g. staatsoper.de) serve a "maintenance" bot-fallback to anything that looks
 // headless; the init script below gets the real page. Verified against staatsoper.de.
-let _browser = null;
-async function getBrowser() {
+let _browser: Browser | null = null;
+async function getBrowser(): Promise<Browser> {
   if (_browser?.isConnected()) return _browser;
   _browser = await chromium.launch({
     headless: true,
@@ -128,7 +130,7 @@ async function getBrowser() {
   return _browser;
 }
 
-async function renderStealth(url, waitMs) {
+async function renderStealth(url: string, waitMs: number): Promise<{ status: number; body: string }> {
   const browser = await getBrowser();
   const ctx = await browser.newContext({
     locale: "de-DE",
@@ -140,7 +142,7 @@ async function renderStealth(url, waitMs) {
     Object.defineProperty(navigator, "webdriver", { get: () => undefined });
     Object.defineProperty(navigator, "languages", { get: () => ["de-DE", "de", "en"] });
     Object.defineProperty(navigator, "plugins", { get: () => [1, 2, 3, 4, 5] });
-    window.chrome = { runtime: {} };
+    (window as unknown as { chrome: unknown }).chrome = { runtime: {} };
   });
   const page = await ctx.newPage();
   try {
@@ -156,14 +158,18 @@ async function renderStealth(url, waitMs) {
  *  FlareSolverr. Cheap heuristic: small 403 response containing the JS-init
  *  fingerprint. Bigger 403 pages (real "forbidden" responses from the origin)
  *  pass through unchanged. */
-function looksLikeCfChallenge(status, body) {
+function looksLikeCfChallenge(status: number, body: Buffer): boolean {
   if (status !== 403 && status !== 503) return false;
   if (body.length > 50_000) return false;
   const head = body.subarray(0, Math.min(body.length, 8192)).toString("utf8");
   return /Just a moment\.\.\./i.test(head) || /cf-chl_/i.test(head) || /__cf_chl_opt/i.test(head);
 }
 
-async function solveWithFlareSolverr(url, method = "GET", body) {
+async function solveWithFlareSolverr(
+  url: string,
+  method: string = "GET",
+  body?: Buffer,
+): Promise<{ status: number; body: string } | null> {
   try {
     const command =
       method === "POST"
@@ -183,7 +189,11 @@ async function solveWithFlareSolverr(url, method = "GET", body) {
       console.warn(`!! flaresolverr http ${res.status}`);
       return null;
     }
-    const data = await res.json();
+    const data = (await res.json()) as {
+      status?: string;
+      message?: string;
+      solution?: { status?: number; response?: string };
+    };
     if (data.status !== "ok" || !data.solution) {
       console.warn(`!! flaresolverr status=${data.status} message=${data.message ?? ""}`);
       return null;
@@ -193,7 +203,7 @@ async function solveWithFlareSolverr(url, method = "GET", body) {
       body: data.solution.response || "",
     };
   } catch (e) {
-    console.warn(`!! flaresolverr threw: ${e.message}`);
+    console.warn(`!! flaresolverr threw: ${errMessage(e)}`);
     return null;
   }
 }

@@ -10,6 +10,6 @@ RUN npm install -g bun@1.3
 # --frozen-lockfile: build fails loudly if bun.lock is stale rather than silently resolving.
 COPY package.json bun.lock ./
 RUN bun install --frozen-lockfile --production
-COPY server.js ./
+COPY server.ts tsconfig.json ./
 EXPOSE 3000
-CMD ["bun", "server.js"]
+CMD ["bun", "server.ts"]
