@@ -201,7 +201,7 @@ async function handleProxy(req: Request, query: ProxyQuery, body?: Buffer): Prom
       const waitMs = Math.min(Number(query.wait) || 6000, 30000);
       const rendered = await renderStealth(url, waitMs, block);
       console.log(`<- ${rendered.status} ${url} (render)`);
-      return buildResponse(rendered.status, rendered.body, "text/html; charset=utf-8", wantMd, url);
+      return buildResponse(rendered.status, rendered.body, rendered.contentType, wantMd, url);
     } catch (e) {
       console.error(`!! render ${url}: ${errMessage(e)}`);
       return Response.json({ error: errMessage(e) }, { status: 502 });
@@ -272,7 +272,7 @@ async function handleProxy(req: Request, query: ProxyQuery, body?: Buffer): Prom
         const rendered = await renderStealth(url, 6000, block);
         if (!looksBlocked(rendered.status, asBuffer(rendered.body))) {
           console.log(`<- ${rendered.status} ${url} (auto render)`);
-          return buildResponse(rendered.status, rendered.body, "text/html; charset=utf-8", wantMd, url);
+          return buildResponse(rendered.status, rendered.body, rendered.contentType, wantMd, url);
         }
         console.warn(`!! stealth render still blocked ${url}`);
       } catch (e) {
@@ -306,7 +306,7 @@ async function renderStealth(
   url: string,
   waitMs: number,
   block = true,
-): Promise<{ status: number; body: string }> {
+): Promise<{ status: number; body: string; contentType: string }> {
   const browser = await getBrowser();
   const ctx = await browser.newContext({
     locale: "de-DE",
@@ -324,8 +324,20 @@ async function renderStealth(
   await enableBlocking(page, block);
   try {
     const resp = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
+    // Non-HTML resources (XML sitemaps, JSON APIs) must pass through as the raw
+    // network body. page.content() returns the live DOM, which for these is
+    // Chromium's built-in pretty-printer (the xml-viewer-style wrapper) — valid
+    // HTML, but no longer parseable as the original XML/JSON the caller asked for.
+    const respContentType = resp?.headers()["content-type"] ?? "";
+    if (resp && respContentType && !/html/i.test(respContentType)) {
+      return { status: resp.status(), body: await resp.text(), contentType: respContentType };
+    }
     if (waitMs) await page.waitForTimeout(waitMs);
-    return { status: resp ? resp.status() : 200, body: await page.content() };
+    return {
+      status: resp ? resp.status() : 200,
+      body: await page.content(),
+      contentType: "text/html; charset=utf-8",
+    };
   } finally {
     await ctx.close();
   }
