@@ -53,10 +53,17 @@ function buildResponse(
 ): Response {
   if (wantMd && /html/i.test(contentType)) {
     const html = typeof body === "string" ? body : body.toString("utf8");
-    return new Response(htmlToMarkdown(html, url), {
-      status,
-      headers: { "content-type": "text/markdown; charset=utf-8" },
-    });
+    // Markdown is a best-effort bonus: Readability/Turndown can throw on a big
+    // JS-rendered page (Turndown recurses per node and overflows the stack on a
+    // deep app shell). Degrade to the raw HTML rather than failing the request.
+    try {
+      return new Response(htmlToMarkdown(html, url), {
+        status,
+        headers: { "content-type": "text/markdown; charset=utf-8" },
+      });
+    } catch (e) {
+      console.warn(`!! markdown conversion failed for ${url}: ${errMessage(e)} — returning raw HTML`);
+    }
   }
   return new Response(body as BodyInit, { status, headers: { "content-type": contentType } });
 }

@@ -10,6 +10,11 @@ const turndown = new TurndownService({
 });
 turndown.use(gfm);
 
+// When Readability finds no article, we'd otherwise Turndown the entire rendered
+// body. Turndown recurses per node, so a big app shell (Elmhurst ~680KB) hangs or
+// overflows the stack. Above this size we bail to raw HTML instead.
+const MAX_FALLBACK_HTML = 200_000;
+
 // Exact containers for the common Consent Management Platforms. Removing the whole
 // subtree (overlay + underlay) is safe — these ids are vendor-owned.
 const CONSENT_SELECTORS = [
@@ -59,17 +64,40 @@ export function htmlToMarkdown(html: string, baseUrl: string): string {
 
   const { document } = parseHTML(withBase);
   stripConsent(document as unknown as Document);
+  // Drop non-content/heavy nodes before conversion: on a JS-rendered page the
+  // full-body fallback feeds Turndown the whole app shell, and Turndown recurses
+  // per node — scripts/styles/inline SVG add the bulk and depth that overflow its
+  // stack. They never belong in Markdown anyway.
+  for (const el of document.querySelectorAll("script,style,noscript,template,svg,iframe")) {
+    el.remove();
+  }
 
-  let contentHtml = document.body?.innerHTML ?? withBase;
+  // Capture the fallback body before Readability, which mutates the document.
+  const fallbackBody = document.body?.innerHTML ?? withBase;
+
   let title = "";
+  let articleHtml: string | undefined;
   try {
     const article = new Readability(document).parse();
     if (article?.content) {
-      contentHtml = article.content;
+      articleHtml = article.content;
       title = article.title?.trim() ?? "";
     }
   } catch {
-    // Non-article page — keep the full-body fallback above.
+    // Non-article page — fall back below.
+  }
+
+  let contentHtml = articleHtml;
+  if (contentHtml === undefined) {
+    // Readability found no article. Converting a whole rendered body is the slow,
+    // stack-blowing path (Turndown recurses per node) and pointless on an app
+    // shell — bail so the caller serves the raw HTML instead of hanging.
+    if (fallbackBody.length > MAX_FALLBACK_HTML) {
+      throw new Error(
+        `no readable article and body too large (${fallbackBody.length} chars) for markdown`,
+      );
+    }
+    contentHtml = fallbackBody;
   }
 
   const md = turndown.turndown(contentHtml).trim();
