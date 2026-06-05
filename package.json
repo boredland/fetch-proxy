@@ -9,6 +9,8 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@elysiajs/openapi": "^1.4.15",
+    "elysia": "^1.4.28",
     "playwright-core": "1.60.0"
   },
   "devDependencies": {

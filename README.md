@@ -2,6 +2,8 @@
 
 A lightweight HTTP proxy for fetching web pages from servers that block datacenter IPs or have broken SSL certificates. Useful as a fallback for sources that reject direct requests from CI / serverless platforms — and, via an optional FlareSolverr sidecar, for sources gated behind Cloudflare's "Just a moment…" interactive challenge.
 
+Built on [Bun](https://bun.com) + [Elysia](https://elysiajs.com), with an interactive [Scalar](https://scalar.com) API reference served at **`/docs`**.
+
 ## Running
 
 ### Plain proxy only (no CF-challenge support)
@@ -40,6 +42,17 @@ All via environment variables:
 | `AUTH_TOKEN` | _(unset)_ | If set, requests must send `Authorization: Bearer <token>` |
 | `FLARESOLVERR_URL` | _(unset)_ | FlareSolverr `/v1` base URL; enables the CF-challenge fallback |
 | `FLARESOLVERR_TIMEOUT_MS` | `60000` | Max time FlareSolverr may spend solving a challenge |
+
+## API reference
+
+An interactive Scalar reference (generated from the route schemas) is served at:
+
+```
+GET /docs        # Scalar UI
+GET /docs/json   # raw OpenAPI 3.0 spec
+```
+
+Both are public — the `AUTH_TOKEN` guard only protects the proxy endpoints.
 
 ## Usage
 
