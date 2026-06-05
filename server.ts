@@ -2,6 +2,7 @@ import { openapi } from "@elysiajs/openapi";
 import { Elysia, t } from "elysia";
 import type { Browser } from "playwright-core";
 import { chromium } from "playwright-core";
+import { enableBlocking } from "./adblock.ts";
 import { htmlToMarkdown } from "./markdown.ts";
 
 const AUTH_TOKEN = process.env.AUTH_TOKEN || "";
@@ -102,6 +103,13 @@ const ProxyQuery = t.Object({
       examples: ["1"],
     }),
   ),
+  block: t.Optional(
+    t.String({
+      description:
+        'Ad/cookie/tracker blocking (uBO-style filter lists) is on by default for rendered pages; set to "0" to disable it for this request.',
+      examples: ["0"],
+    }),
+  ),
 });
 type ProxyQuery = typeof ProxyQuery.static;
 
@@ -183,13 +191,15 @@ async function handleProxy(req: Request, query: ProxyQuery, body?: Buffer): Prom
   // Auto-escalation: on by default if AUTO_FALLBACK is set, unless `?auto=0`; or
   // opt in per-request with `?auto=1`.
   const auto = query.auto === "1" || (AUTO_FALLBACK && query.auto !== "0");
+  // Ad/cookie/tracker blocking is on by default for rendered pages; `?block=0` opts out.
+  const block = query.block !== "0";
   if (!url) return Response.json({ error: "?url= parameter required" }, { status: 400 });
 
   if (render) {
     console.log(`-> RENDER ${url}`);
     try {
       const waitMs = Math.min(Number(query.wait) || 6000, 30000);
-      const rendered = await renderStealth(url, waitMs);
+      const rendered = await renderStealth(url, waitMs, block);
       console.log(`<- ${rendered.status} ${url} (render)`);
       return buildResponse(rendered.status, rendered.body, "text/html; charset=utf-8", wantMd, url);
     } catch (e) {
@@ -259,7 +269,7 @@ async function handleProxy(req: Request, query: ProxyQuery, body?: Buffer): Prom
     if (auto && looksBlocked(best.status, asBuffer(best.body))) {
       console.log(`?? auto fallback on ${method} ${url} — via stealth render`);
       try {
-        const rendered = await renderStealth(url, 6000);
+        const rendered = await renderStealth(url, 6000, block);
         if (!looksBlocked(rendered.status, asBuffer(rendered.body))) {
           console.log(`<- ${rendered.status} ${url} (auto render)`);
           return buildResponse(rendered.status, rendered.body, "text/html; charset=utf-8", wantMd, url);
@@ -295,6 +305,7 @@ async function getBrowser(): Promise<Browser> {
 async function renderStealth(
   url: string,
   waitMs: number,
+  block = true,
 ): Promise<{ status: number; body: string }> {
   const browser = await getBrowser();
   const ctx = await browser.newContext({
@@ -310,6 +321,7 @@ async function renderStealth(
     (window as unknown as { chrome: unknown }).chrome = { runtime: {} };
   });
   const page = await ctx.newPage();
+  await enableBlocking(page, block);
   try {
     const resp = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
     if (waitMs) await page.waitForTimeout(waitMs);
