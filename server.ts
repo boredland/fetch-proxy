@@ -2,6 +2,7 @@ import { openapi } from "@elysiajs/openapi";
 import { Elysia, t } from "elysia";
 import type { Browser } from "playwright-core";
 import { chromium } from "playwright-core";
+import { htmlToMarkdown } from "./markdown.ts";
 
 const AUTH_TOKEN = process.env.AUTH_TOKEN || "";
 const PORT = Number(process.env.PORT || 3000);
@@ -16,6 +17,26 @@ const CHROME_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36";
 
 const errMessage = (e: unknown): string => (e instanceof Error ? e.message : String(e));
+
+/** Build the upstream passthrough response, converting to Markdown when the
+ *  caller asked for it and the payload is actually HTML (non-HTML bodies — JSON,
+ *  images, downloads — pass through untouched even with format=md). */
+function buildResponse(
+  status: number,
+  body: Buffer | string,
+  contentType: string,
+  wantMd: boolean,
+  url: string,
+): Response {
+  if (wantMd && /html/i.test(contentType)) {
+    const html = typeof body === "string" ? body : body.toString("utf8");
+    return new Response(htmlToMarkdown(html, url), {
+      status,
+      headers: { "content-type": "text/markdown; charset=utf-8" },
+    });
+  }
+  return new Response(body as BodyInit, { status, headers: { "content-type": contentType } });
+}
 
 // Shared by GET and POST. Optional everywhere so a missing `url` returns our own
 // 400 (preserving the original contract) rather than Elysia's 422; the values
@@ -43,6 +64,13 @@ const ProxyQuery = t.Object({
     t.String({
       description: "With render=1, ms to let the SPA's XHR content settle (default 6000, max 30000).",
       examples: ["6000"],
+    }),
+  ),
+  format: t.Optional(
+    t.String({
+      description:
+        'Set to "md" to convert the fetched HTML to Markdown (Readability main-content extraction; nav/ads dropped, links absolutized).',
+      examples: ["md"],
     }),
   ),
 });
@@ -119,6 +147,9 @@ async function handleProxy(req: Request, query: ProxyQuery, body?: Buffer): Prom
   // serve a bot-fallback to anything headless-looking (e.g. staatsoper.de) — keeps
   // the browser on the proxy's (residential) IP so callers need no browser of their own.
   const render = query.render === "1";
+  // `format=md` converts whatever HTML we end up with (direct, FlareSolverr, or
+  // rendered) into Markdown — see buildResponse.
+  const wantMd = query.format === "md";
   if (!url) return Response.json({ error: "?url= parameter required" }, { status: 400 });
 
   if (render) {
@@ -127,10 +158,7 @@ async function handleProxy(req: Request, query: ProxyQuery, body?: Buffer): Prom
       const waitMs = Math.min(Number(query.wait) || 6000, 30000);
       const rendered = await renderStealth(url, waitMs);
       console.log(`<- ${rendered.status} ${url} (render)`);
-      return new Response(rendered.body, {
-        status: rendered.status,
-        headers: { "content-type": "text/html; charset=utf-8" },
-      });
+      return buildResponse(rendered.status, rendered.body, "text/html; charset=utf-8", wantMd, url);
     } catch (e) {
       console.error(`!! render ${url}: ${errMessage(e)}`);
       return Response.json({ error: errMessage(e) }, { status: 502 });
@@ -170,19 +198,19 @@ async function handleProxy(req: Request, query: ProxyQuery, body?: Buffer): Prom
       const solved = await solveWithFlareSolverr(url, method, reqBody);
       if (solved) {
         console.log(`<- ${solved.status} ${url} (flaresolverr)`);
-        return new Response(solved.body, {
-          status: solved.status,
-          headers: { "content-type": "text/html; charset=utf-8" },
-        });
+        return buildResponse(solved.status, solved.body, "text/html; charset=utf-8", wantMd, url);
       }
       console.warn(`!! FlareSolverr failed to solve ${url}; returning original 403`);
     }
 
     console.log(`<- ${direct.status} ${url}`);
-    return new Response(directBody, {
-      status: direct.status,
-      headers: { "content-type": direct.headers.get("content-type") || "text/html" },
-    });
+    return buildResponse(
+      direct.status,
+      directBody,
+      direct.headers.get("content-type") || "text/html",
+      wantMd,
+      url,
+    );
   } catch (e) {
     console.error(`!! ${url}: ${errMessage(e)}`);
     return Response.json({ error: errMessage(e) }, { status: 502 });
