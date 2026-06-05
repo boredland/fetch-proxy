@@ -1,0 +1,12 @@
+{
+  "name": "fetch-proxy",
+  "version": "0.0.1",
+  "main": "server.js",
+  "scripts": {
+    "dev": "node server.js",
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "playwright-core": "1.60.0"
+  }
+}

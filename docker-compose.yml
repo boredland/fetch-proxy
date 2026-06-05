@@ -1,0 +1,40 @@
+# Two-service stack: the lightweight fetch-proxy + a FlareSolverr sidecar
+# that solves Cloudflare interactive challenges via headless Chromium. The
+# proxy forwards normal traffic itself and only invokes FlareSolverr when it
+# detects a "Just a moment…" response, so the FS container stays cold most of
+# the time.
+#
+# Deploy on Dokploy: import this file as a Compose service. Set AUTH_TOKEN
+# as a stack-level secret. The proxy stays exposed on :3000; FlareSolverr is
+# only reachable inside the compose network.
+
+services:
+  fetch-proxy:
+    build: .
+    restart: unless-stopped
+    # No host-port bind — Dokploy/Traefik reaches the container on the
+    # internal docker network on port 3000 (the container's EXPOSE) and
+    # handles public ingress via the attached domain. A host bind would
+    # collide with any other service also listening on :3000.
+    expose:
+      - "3000"
+    environment:
+      AUTH_TOKEN: ${AUTH_TOKEN:-}
+      FLARESOLVERR_URL: http://flaresolverr:8191
+    # No `condition: service_healthy` — the FlareSolverr image doesn't ship
+    # with wget/curl, so a portable healthcheck is hard. Plain `depends_on`
+    # just enforces start order. If a CF challenge hits before FS is ready,
+    # the FS call fails with a connection error and the proxy returns the
+    # original 403 (caller can retry).
+    depends_on:
+      - flaresolverr
+
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    restart: unless-stopped
+    environment:
+      LOG_LEVEL: info
+      TZ: Europe/Berlin
+      # Keep the Chromium pool small — we burst-call FS for a handful of
+      # detail-page fetches per scrape, not parallel high-volume use.
+      BROWSER_LIMIT: "2"
