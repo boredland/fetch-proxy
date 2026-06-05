@@ -1,18 +1,14 @@
 import { Readability } from "@mozilla/readability";
 import { parseHTML } from "linkedom";
-import TurndownService from "turndown";
-import { gfm } from "turndown-plugin-gfm";
+import { NodeHtmlMarkdown } from "node-html-markdown";
 
-const turndown = new TurndownService({
-  headingStyle: "atx",
-  codeBlockStyle: "fenced",
-  bulletListMarker: "-",
-});
-turndown.use(gfm);
+// node-html-markdown over Turndown: it's iterative and built for throughput, so it
+// doesn't recurse-per-node into a stack overflow on big rendered DOMs (the Turndown
+// failure mode on app shells like Elmhurst), and ships GFM (tables/strikethrough).
+const nhm = new NodeHtmlMarkdown({ bulletMarker: "-", codeFence: "```", codeBlockStyle: "fenced" });
 
-// When Readability finds no article, we'd otherwise Turndown the entire rendered
-// body. Turndown recurses per node, so a big app shell (Elmhurst ~680KB) hangs or
-// overflows the stack. Above this size we bail to raw HTML instead.
+// Even so, skip the no-article full-body fallback above this size: converting a
+// whole rendered app shell is slow and pointless — bail to raw HTML instead.
 const MAX_FALLBACK_HTML = 200_000;
 
 // Exact containers for the common Consent Management Platforms. Removing the whole
@@ -100,6 +96,6 @@ export function htmlToMarkdown(html: string, baseUrl: string): string {
     contentHtml = fallbackBody;
   }
 
-  const md = turndown.turndown(contentHtml).trim();
+  const md = nhm.translate(contentHtml).trim();
   return title ? `# ${title}\n\n${md}\n` : `${md}\n`;
 }
