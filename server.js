@@ -1,10 +1,7 @@
-const http = require("node:http");
-const { chromium } = require("playwright-core");
-
-process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+import { chromium } from "playwright-core";
 
 const AUTH_TOKEN = process.env.AUTH_TOKEN || "";
-const PORT = process.env.PORT || 3000;
+const PORT = Number(process.env.PORT || 3000);
 // Optional sidecar FlareSolverr (https://github.com/FlareSolverr/FlareSolverr) —
 // when set, requests that come back as a Cloudflare "Just a moment…" challenge
 // are retried through a headless Chromium that can solve it. Provision via
@@ -15,18 +12,19 @@ const FLARESOLVERR_TIMEOUT_MS = Number(process.env.FLARESOLVERR_TIMEOUT_MS || 60
 const CHROME_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36";
 
-http
-  .createServer(async (req, res) => {
-    if (AUTH_TOKEN) {
-      const auth = req.headers.authorization;
-      if (auth !== `Bearer ${AUTH_TOKEN}`) {
-        res.writeHead(401, { "content-type": "application/json" });
-        res.end('{"error":"unauthorized"}');
-        return;
-      }
+const json = (status, obj) => Response.json(obj, { status });
+
+Bun.serve({
+  port: PORT,
+  // The ?render=1 path drives a real Chromium (goto up to 45s + settle up to
+  // 30s), well past Bun's 10s default. Hold connections open long enough for it.
+  idleTimeout: 180,
+  async fetch(req) {
+    if (AUTH_TOKEN && req.headers.get("authorization") !== `Bearer ${AUTH_TOKEN}`) {
+      return json(401, { error: "unauthorized" });
     }
 
-    const params = new URL(req.url, `http://${req.headers.host}`).searchParams;
+    const params = new URL(req.url).searchParams;
     const url = params.get("url");
     // `&solve=1` forces the FlareSolverr path even when the heuristic doesn't fire —
     // for JS-execution challenges that don't match the cheap CF fingerprint (e.g. a
@@ -38,11 +36,7 @@ http
     // the browser on the proxy's (residential) IP so callers need no browser of their
     // own. `&wait=<ms>` lets the SPA's XHR content settle (default 6000).
     const render = params.get("render") === "1";
-    if (!url) {
-      res.writeHead(400, { "content-type": "application/json" });
-      res.end('{"error":"?url= parameter required"}');
-      return;
-    }
+    if (!url) return json(400, { error: "?url= parameter required" });
 
     if (render) {
       console.log(`-> RENDER ${url}`);
@@ -50,14 +44,14 @@ http
         const waitMs = Math.min(Number(params.get("wait")) || 6000, 30000);
         const rendered = await renderStealth(url, waitMs);
         console.log(`<- ${rendered.status} ${url} (render)`);
-        res.writeHead(rendered.status, { "content-type": "text/html; charset=utf-8" });
-        res.end(rendered.body);
+        return new Response(rendered.body, {
+          status: rendered.status,
+          headers: { "content-type": "text/html; charset=utf-8" },
+        });
       } catch (e) {
         console.error(`!! render ${url}: ${e.message}`);
-        res.writeHead(502, { "content-type": "application/json" });
-        res.end(JSON.stringify({ error: e.message }));
+        return json(502, { error: e.message });
       }
-      return;
     }
 
     // Mirror the caller's method/body so form POSTs (not just GET fetches)
@@ -65,14 +59,16 @@ http
     // the UA is always replaced with CHROME_UA, which is the whole point of
     // the proxy.
     const method = req.method || "GET";
-    const reqBody = method === "GET" || method === "HEAD" ? undefined : await readBody(req);
-    const contentType = req.headers["content-type"];
+    const reqBody =
+      method === "GET" || method === "HEAD" ? undefined : Buffer.from(await req.arrayBuffer());
+    const contentType = req.headers.get("content-type");
 
     console.log(`-> ${method} ${url}`);
     try {
       // Step 1: plain fetch with a Chrome UA. Handles the common cases
       // (datacenter-IP blocks, broken TLS chains, anti-bot heuristics that
-      // only check headers).
+      // only check headers). TLS verification is disabled per-request to
+      // tolerate servers with incomplete certificate chains.
       const upstreamHeaders = { "User-Agent": CHROME_UA };
       if (reqBody && contentType) upstreamHeaders["content-type"] = contentType;
       const direct = await fetch(url, {
@@ -80,6 +76,7 @@ http
         headers: upstreamHeaders,
         body: reqBody,
         redirect: "follow",
+        tls: { rejectUnauthorized: false },
       });
       const directBody = Buffer.from(await direct.arrayBuffer());
 
@@ -94,28 +91,28 @@ http
         const solved = await solveWithFlareSolverr(url, method, reqBody);
         if (solved) {
           console.log(`<- ${solved.status} ${url} (flaresolverr)`);
-          res.writeHead(solved.status, { "content-type": "text/html; charset=utf-8" });
-          res.end(solved.body);
-          return;
+          return new Response(solved.body, {
+            status: solved.status,
+            headers: { "content-type": "text/html; charset=utf-8" },
+          });
         }
         console.warn(`!! FlareSolverr failed to solve ${url}; returning original 403`);
       }
 
       console.log(`<- ${direct.status} ${url}`);
-      res.writeHead(direct.status, {
-        "content-type": direct.headers.get("content-type") || "text/html",
+      return new Response(directBody, {
+        status: direct.status,
+        headers: { "content-type": direct.headers.get("content-type") || "text/html" },
       });
-      res.end(directBody);
     } catch (e) {
       console.error(`!! ${url}: ${e.message}`);
-      res.writeHead(502, { "content-type": "application/json" });
-      res.end(JSON.stringify({ error: e.message }));
+      return json(502, { error: e.message });
     }
-  })
-  .listen(PORT, () => {
-    console.log(`fetch-proxy listening on :${PORT}`);
-    if (FLARESOLVERR_URL) console.log(`flaresolverr sidecar: ${FLARESOLVERR_URL}`);
-  });
+  },
+});
+
+console.log(`fetch-proxy listening on :${PORT}`);
+if (FLARESOLVERR_URL) console.log(`flaresolverr sidecar: ${FLARESOLVERR_URL}`);
 
 // ── Stealth render ───────────────────────────────────────────────────────────
 // A shared headless Chromium that masks the standard automation tells. Some sites
@@ -155,15 +152,6 @@ async function renderStealth(url, waitMs) {
   }
 }
 
-function readBody(req) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    req.on("data", (chunk) => chunks.push(chunk));
-    req.on("end", () => resolve(chunks.length ? Buffer.concat(chunks) : undefined));
-    req.on("error", reject);
-  });
-}
-
 /** Detect a Cloudflare interactive challenge so we know to fall back to
  *  FlareSolverr. Cheap heuristic: small 403 response containing the JS-init
  *  fingerprint. Bigger 403 pages (real "forbidden" responses from the origin)
@@ -179,7 +167,12 @@ async function solveWithFlareSolverr(url, method = "GET", body) {
   try {
     const command =
       method === "POST"
-        ? { cmd: "request.post", url, postData: body ? body.toString("utf8") : "", maxTimeout: FLARESOLVERR_TIMEOUT_MS }
+        ? {
+            cmd: "request.post",
+            url,
+            postData: body ? body.toString("utf8") : "",
+            maxTimeout: FLARESOLVERR_TIMEOUT_MS,
+          }
         : { cmd: "request.get", url, maxTimeout: FLARESOLVERR_TIMEOUT_MS };
     const res = await fetch(`${FLARESOLVERR_URL.replace(/\/$/, "")}/v1`, {
       method: "POST",

@@ -1,0 +1,8 @@
+# Supply-chain hardening: refuse to install npm versions younger than 3 days.
+# Blunts the standard malware pattern of attackers publishing a new release
+# and immediately trying to get downstream installs. Only affects new
+# resolutions — existing entries in bun.lock are unchanged.
+#
+# Docs: https://bun.com/docs/cli/install#minimum-release-age
+[install]
+minimumReleaseAge = 259200  # 3 days, in seconds

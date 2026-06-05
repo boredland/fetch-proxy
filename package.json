@@ -1,10 +1,11 @@
 {
   "name": "fetch-proxy",
   "version": "0.0.1",
-  "main": "server.js",
+  "type": "module",
+  "module": "server.js",
   "scripts": {
-    "dev": "node server.js",
-    "start": "node server.js"
+    "dev": "bun --watch server.js",
+    "start": "bun server.js"
   },
   "dependencies": {
     "playwright-core": "1.60.0"

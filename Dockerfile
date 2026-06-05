@@ -4,7 +4,12 @@
 # version as package.json.
 FROM mcr.microsoft.com/playwright:v1.60.0-jammy
 WORKDIR /app
-COPY package.json server.js ./
-RUN npm install --omit=dev
+# Bun is the runtime; the base image only ships node, so pull in the bun binary.
+# Installed via npm so we don't need curl/unzip and the version tracks the image's node.
+RUN npm install -g bun@1.3
+# --frozen-lockfile: build fails loudly if bun.lock is stale rather than silently resolving.
+COPY package.json bun.lock ./
+RUN bun install --frozen-lockfile --production
+COPY server.js ./
 EXPOSE 3000
-CMD ["node", "server.js"]
+CMD ["bun", "server.js"]
