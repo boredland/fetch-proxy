@@ -18,8 +18,19 @@ const FLARESOLVERR_TIMEOUT_MS = Number(process.env.FLARESOLVERR_TIMEOUT_MS || 60
 // with `?auto=1` / `?auto=0`.
 const AUTO_FALLBACK = process.env.AUTO_FALLBACK === "1";
 
+// Resilience caps. The proxy is fronted by a CDN (Cloudflare/Traefik) whose
+// origin timeout is ~100s — past that the caller gets an opaque 524 instead of a
+// real status. So every upstream op is bounded, and the whole request is bounded
+// by REQUEST_BUDGET_MS (< the CDN cutoff): we'd rather return our own 504/502
+// (which clients retry) than let the connection time out under the CDN.
+const FETCH_TIMEOUT_MS = Number(process.env.FETCH_TIMEOUT_MS || 20000); // tier-1 plain fetch
+const REQUEST_BUDGET_MS = Number(process.env.REQUEST_BUDGET_MS || 90000); // whole request
+// The hourly scrape rotation hits the proxy in bursts; many parallel renders
+// thrash one shared Chromium. Cap concurrent stealth renders — excess ones queue.
+const RENDER_CONCURRENCY = Number(process.env.RENDER_CONCURRENCY || 3);
+
 const CHROME_UA =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36";
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
 const errMessage = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 const asBuffer = (b: Buffer | string): Buffer => (typeof b === "string" ? Buffer.from(b, "utf8") : b);
@@ -239,7 +250,35 @@ const app = new Elysia()
 export type App = typeof app;
 
 async function handleProxy(req: Request, query: ProxyQuery, body?: Buffer): Promise<Response> {
+  if (!query.url) return Response.json({ error: "?url= parameter required" }, { status: 400 });
   const url = query.url;
+  // Guarantee a response within REQUEST_BUDGET_MS (< the fronting CDN's ~100s 524
+  // cutoff): race the work against a deadline that aborts in-flight fetches and
+  // returns a structured 504 the caller can retry. Without this a slow target — or
+  // a long plain->FlareSolverr->render auto chain — hangs until the CDN 524s opaquely.
+  const ac = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<Response>((resolve) => {
+    timer = setTimeout(() => {
+      ac.abort();
+      console.error(`!! budget ${REQUEST_BUDGET_MS}ms exceeded for ${url}`);
+      resolve(Response.json({ error: "upstream timeout" }, { status: 504 }));
+    }, REQUEST_BUDGET_MS);
+  });
+  try {
+    return await Promise.race([runProxy(req, query, url, ac.signal, body), deadline]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function runProxy(
+  req: Request,
+  query: ProxyQuery,
+  url: string,
+  signal: AbortSignal,
+  body?: Buffer,
+): Promise<Response> {
   const forceSolve = query.solve === "1";
   // `render=1` returns the page rendered by a STEALTH headless Chromium (masks the
   // navigator.webdriver / window.chrome / plugins tells). For JS-rendered SPAs that
@@ -254,7 +293,6 @@ async function handleProxy(req: Request, query: ProxyQuery, body?: Buffer): Prom
   const auto = query.auto === "1" || (AUTO_FALLBACK && query.auto !== "0");
   // Ad/cookie/tracker blocking is on by default for rendered pages; `?block=0` opts out.
   const block = query.block !== "0";
-  if (!url) return Response.json({ error: "?url= parameter required" }, { status: 400 });
 
   if (render) {
     console.log(`-> RENDER ${url}`);
@@ -288,6 +326,9 @@ async function handleProxy(req: Request, query: ProxyQuery, body?: Buffer): Prom
       body: reqBody as BodyInit | undefined,
       redirect: "follow",
       tls: { rejectUnauthorized: false },
+      // Bound the plain fetch: a slow/hung target must not hold the request open
+      // until the CDN 524s. Aborts on the per-op timeout or the global budget.
+      signal: AbortSignal.any([AbortSignal.timeout(FETCH_TIMEOUT_MS), signal]),
     });
     const directBody = Buffer.from(await direct.arrayBuffer());
 
@@ -311,7 +352,7 @@ async function handleProxy(req: Request, query: ProxyQuery, body?: Buffer): Prom
     if (FLARESOLVERR_URL && (forceSolve || cfChallenge)) {
       const reason = forceSolve ? "forced solve" : "CF challenge";
       console.log(`?? ${reason} on ${method} ${url} — via FlareSolverr`);
-      const solved = await solveWithFlareSolverr(url, method, reqBody);
+      const solved = await solveWithFlareSolverr(url, method, reqBody, signal);
       if (solved) {
         best = { status: solved.status, body: solved.body, contentType: "text/html; charset=utf-8" };
         if (!looksBlocked(solved.status, asBuffer(solved.body))) {
@@ -362,11 +403,46 @@ async function getBrowser(): Promise<Browser> {
   return _browser;
 }
 
+// Soft concurrency cap on stealth renders. Each render gets its own browser
+// context (isolated) but they all share one Chromium process; under the hourly
+// scrape burst, too many at once thrash it and slow every render toward the
+// budget. Excess renders queue here instead. A soft cap is fine — a small
+// transient overshoot under interleaving doesn't matter.
+let _renderActive = 0;
+const _renderWaiters: Array<() => void> = [];
+async function acquireRenderSlot(): Promise<() => void> {
+  if (_renderActive >= RENDER_CONCURRENCY) {
+    await new Promise<void>((resolve) => _renderWaiters.push(resolve));
+  }
+  _renderActive++;
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    _renderActive--;
+    _renderWaiters.shift()?.();
+  };
+}
+
 async function renderStealth(
   url: string,
   req: Request,
   waitMs: number,
   block = true,
+): Promise<{ status: number; body: string; contentType: string }> {
+  const release = await acquireRenderSlot();
+  try {
+    return await renderStealthInner(url, req, waitMs, block);
+  } finally {
+    release();
+  }
+}
+
+async function renderStealthInner(
+  url: string,
+  req: Request,
+  waitMs: number,
+  block: boolean,
 ): Promise<{ status: number; body: string; contentType: string }> {
   const browser = await getBrowser();
   // Honor the caller's Accept-Language so the rendered page — and its navigator.languages
@@ -427,6 +503,7 @@ async function solveWithFlareSolverr(
   url: string,
   method: string = "GET",
   body?: Buffer,
+  signal?: AbortSignal,
 ): Promise<{ status: number; body: string } | null> {
   try {
     const command =
@@ -438,10 +515,15 @@ async function solveWithFlareSolverr(
             maxTimeout: FLARESOLVERR_TIMEOUT_MS,
           }
         : { cmd: "request.get", url, maxTimeout: FLARESOLVERR_TIMEOUT_MS };
+    // Bound the call to FlareSolverr by its own maxTimeout (+ a margin) and the
+    // global budget, so a hung/queued sidecar can't hold the request open.
+    const timeouts = [AbortSignal.timeout(FLARESOLVERR_TIMEOUT_MS + 5000)];
+    if (signal) timeouts.push(signal);
     const res = await fetch(`${FLARESOLVERR_URL.replace(/\/$/, "")}/v1`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(command),
+      signal: AbortSignal.any(timeouts),
     });
     if (!res.ok) {
       console.warn(`!! flaresolverr http ${res.status}`);

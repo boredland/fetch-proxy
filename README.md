@@ -43,6 +43,9 @@ All via environment variables:
 | `FLARESOLVERR_URL` | _(unset)_ | FlareSolverr `/v1` base URL; enables the CF-challenge fallback |
 | `FLARESOLVERR_TIMEOUT_MS` | `60000` | Max time FlareSolverr may spend solving a challenge |
 | `AUTO_FALLBACK` | _(unset)_ | Set to `1` to auto-escalate every request (plain → FlareSolverr → render) when a response looks blocked. Per-request `?auto=` overrides it. |
+| `FETCH_TIMEOUT_MS` | `20000` | Per-op timeout for the tier-1 plain fetch, so a slow target can't hold the request open. |
+| `REQUEST_BUDGET_MS` | `90000` | Hard ceiling for the whole request. On overrun the proxy aborts in-flight fetches and returns a `504` — kept under a fronting CDN's ~100s `524` cutoff so callers get a retryable status instead of an opaque timeout. |
+| `RENDER_CONCURRENCY` | `3` | Max concurrent stealth renders; excess ones queue (they share one Chromium, so bursts otherwise thrash it). |
 | `ADBLOCK` | `1` (on) | Ad/cookie/tracker blocking ([uBO-style filter lists](https://github.com/ghostery/adblocker)) on rendered pages. Set to `0` to disable. Per-request `?block=0` overrides it. |
 | `ADBLOCK_LISTS` | cookie + ads + tracking | Comma-separated filter-list URLs to override the defaults (EasyList Cookie List, uBO cookie annoyances, EasyList, EasyPrivacy). |
 
