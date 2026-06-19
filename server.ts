@@ -488,15 +488,28 @@ async function renderStealthInner(
   }
 }
 
-/** Detect a Cloudflare interactive challenge so we know to fall back to
- *  FlareSolverr. Cheap heuristic: small 403 response containing the JS-init
- *  fingerprint. Bigger 403 pages (real "forbidden" responses from the origin)
- *  pass through unchanged. */
+// Cloudflare challenge/interstitial fingerprints. Two shapes occur: the classic
+// "Just a moment…" interstitial carries the cf-chl_ / __cf_chl_opt JS-init markers
+// near the top; the newer *managed-challenge* variant renders a page titled
+// "403 - Forbidden" that inlines fonts/CSS and only loads the
+// /cdn-cgi/challenge-platform/ script near the very END of a ~90KB+ body. Both are
+// solvable by FlareSolverr. The markers are CF-internal, so a genuine origin 403/503
+// (an app-level "forbidden") contains none of them and is never sent to the solver.
+const CF_CHALLENGE = /Just a moment\.\.\.|cf-chl_|__cf_chl_opt|\/cdn-cgi\/challenge-platform\//i;
+// Challenge pages are HTML interstitials, never huge documents; cap the scan so a
+// large real download (which is never a challenge) isn't read end-to-end.
+const CF_CHALLENGE_MAX_BYTES = 512_000;
+
+/** Detect a Cloudflare challenge so we know to fall back to FlareSolverr. Keys on the
+ *  CF-specific fingerprints above, scanning the WHOLE body — the managed-challenge
+ *  script sits at the end, past the head window an earlier version checked, on a body
+ *  far larger than the 50KB cap it used (a real CF challenge was being missed on all
+ *  three counts). A real "forbidden" response from the origin carries none of these
+ *  markers and passes through unchanged. */
 function looksLikeCfChallenge(status: number, body: Buffer): boolean {
   if (status !== 403 && status !== 503) return false;
-  if (body.length > 50_000) return false;
-  const head = body.subarray(0, Math.min(body.length, 8192)).toString("utf8");
-  return /Just a moment\.\.\./i.test(head) || /cf-chl_/i.test(head) || /__cf_chl_opt/i.test(head);
+  if (body.length > CF_CHALLENGE_MAX_BYTES) return false;
+  return CF_CHALLENGE.test(body.toString("utf8"));
 }
 
 async function solveWithFlareSolverr(

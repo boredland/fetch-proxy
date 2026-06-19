@@ -107,7 +107,7 @@ Authorization: Bearer <AUTH_TOKEN>
 **Request flow:**
 
 1. Plain `fetch()` with a Chrome User-Agent — handles datacenter-IP blocks and broken TLS chains.
-2. If the response looks like a CF interactive challenge (403/503 + "Just a moment…" body) **and** `FLARESOLVERR_URL` is set, retry via FlareSolverr's `/v1` endpoint. FlareSolverr renders the page in a headless Chromium, solves the JS proof-of-work, and returns the resolved HTML.
+2. If the response looks like a Cloudflare challenge (403/503 carrying a CF fingerprint — the classic "Just a moment…" / `cf-chl_` interstitial, or the newer managed-challenge page that loads `/cdn-cgi/challenge-platform/`) **and** `FLARESOLVERR_URL` is set, retry via FlareSolverr's `/v1` endpoint. FlareSolverr renders the page in a headless Chromium, solves the JS proof-of-work, and returns the resolved HTML.
 3. Otherwise pass the original response through.
 4. With `?auto=1` (or `AUTO_FALLBACK=1`), if a tier's response still looks blocked, escalate to the next one (plain → FlareSolverr → stealth render); the first non-blocked result wins, else the original upstream response is returned.
 5. If `format=md` was requested and the result is HTML, convert it to Markdown before returning.
