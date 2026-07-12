@@ -1,6 +1,6 @@
 import { openapi } from "@elysiajs/openapi";
 import { Elysia, t } from "elysia";
-import type { Browser } from "playwright-core";
+import type { Browser, BrowserContext } from "playwright-core";
 import { chromium } from "playwright-core";
 import { enableBlocking } from "./adblock.ts";
 import { htmlToMarkdown } from "./markdown.ts";
@@ -155,6 +155,15 @@ const ProxyQuery = t.Object({
       examples: ["1"],
     }),
   ),
+  session: t.Optional(
+    t.String({
+      description:
+        'Set to "1" to run a multi-step session: POST a JSON array of {url,method,body,headers} steps; ' +
+        "they run in one stealth browser context (shared cookies) and the last step's response is returned. " +
+        "For stateful search backends where one request registers a query and another reads it.",
+      examples: ["1"],
+    }),
+  ),
   wait: t.Optional(
     t.String({
       description: "With render=1, ms to let the SPA's XHR content settle (default 6000, max 30000).",
@@ -247,6 +256,11 @@ const app = new Elysia()
     if (FLARESOLVERR_URL) console.log(`flaresolverr sidecar: ${FLARESOLVERR_URL}`);
   });
 
+// A single malformed upstream (e.g. Playwright choking on a bad Set-Cookie during a
+// browser fetch) must never take the whole proxy down — log and keep serving.
+process.on("unhandledRejection", (reason) => console.error(`!! unhandledRejection: ${errMessage(reason)}`));
+process.on("uncaughtException", (err) => console.error(`!! uncaughtException: ${errMessage(err)}`));
+
 export type App = typeof app;
 
 async function handleProxy(req: Request, query: ProxyQuery, body?: Buffer): Promise<Response> {
@@ -303,6 +317,22 @@ async function runProxy(
       return buildResponse(rendered.status, rendered.body, rendered.contentType, wantMd, url);
     } catch (e) {
       console.error(`!! render ${url}: ${errMessage(e)}`);
+      return Response.json({ error: errMessage(e) }, { status: 502 });
+    }
+  }
+
+  // `session=1` runs a scripted multi-step flow (POST body = JSON array of steps) in one
+  // stealth context so cookie-bound session state carries between requests. `url` is only
+  // the log/label here; the real targets are the step URLs.
+  if (query.session === "1") {
+    console.log(`-> SESSION ${url}`);
+    try {
+      const steps = parseSessionSteps(body);
+      const result = await runSession(req, steps, signal);
+      console.log(`<- ${result.status} ${url} (session, ${steps.length} steps)`);
+      return buildResponse(result.status, result.body, result.contentType, wantMd, url);
+    } catch (e) {
+      console.error(`!! session ${url}: ${errMessage(e)}`);
       return Response.json({ error: errMessage(e) }, { status: 502 });
     }
   }
@@ -438,12 +468,97 @@ async function renderStealth(
   }
 }
 
-async function renderStealthInner(
-  url: string,
-  req: Request,
-  waitMs: number,
-  block: boolean,
-): Promise<{ status: number; body: string; contentType: string }> {
+// ── Session (multi-step) ──────────────────────────────────────────────────────
+// Some search backends are stateful: one request registers a query in a server-side
+// session (cookie-bound), a second reads it back. A single stateless proxy call can't
+// bridge them. `runSession` runs an ordered list of requests inside ONE stealth browser
+// context, issued from INSIDE the loaded page via fetch() — Chromium's own cookie jar
+// carries the session across steps — on the proxy's non-blocked IP. The LAST step's
+// response is returned.
+
+interface SessionStep {
+  url: string;
+  method?: string;
+  /** JSON body (object/array serialized) or a raw string; sent as request data. */
+  body?: unknown;
+  headers?: Record<string, string>;
+}
+
+function parseSessionSteps(body: Buffer | undefined): SessionStep[] {
+  if (!body || body.length === 0) throw new Error("session: request body must be a JSON array of steps");
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body.toString("utf8"));
+  } catch {
+    throw new Error("session: request body is not valid JSON");
+  }
+  const steps = Array.isArray(parsed) ? parsed : (parsed as { steps?: unknown }).steps;
+  if (!Array.isArray(steps) || steps.length === 0) throw new Error("session: expected a non-empty array of steps");
+  return steps.map((raw, i) => {
+    const step = raw as SessionStep;
+    if (!step || typeof step.url !== "string") throw new Error(`session: step ${i} needs a "url"`);
+    return step;
+  });
+}
+
+interface StepResult {
+  status: number;
+  body: string;
+  contentType: string;
+}
+
+async function runSession(req: Request, steps: SessionStep[], signal: AbortSignal): Promise<StepResult> {
+  const release = await acquireRenderSlot();
+  const ctx = await newStealthContext(req);
+  try {
+    const page = await ctx.newPage();
+    // Load the origin first so in-page fetch() is same-origin (sends cookies, satisfies
+    // CORS/referer) and inherits the session the backend sets. Derive it from step 1's URL.
+    await page.goto(new URL(steps[0]!.url).origin, { waitUntil: "domcontentloaded", timeout: 45000 });
+
+    let last: StepResult | null = null;
+    for (const step of steps) {
+      if (signal.aborted) throw new Error("session: aborted (budget exceeded)");
+      const method = (step.method ?? (step.body != null ? "POST" : "GET")).toUpperCase();
+      const bodyStr =
+        step.body == null ? undefined : typeof step.body === "string" ? step.body : JSON.stringify(step.body);
+      const jsonDefault = step.body != null && typeof step.body !== "string";
+      // Run the request from INSIDE the page: uses Chromium's own networking + cookie jar,
+      // so the server-side session carries between steps. (context.request's cookie parser
+      // chokes on some hosts' malformed Set-Cookie; the in-page path avoids it entirely.)
+      last = await page.evaluate(
+        async ([url, method, bodyStr, headers, jsonDefault]) => {
+          const h: Record<string, string> = { ...(headers as Record<string, string>) };
+          if (jsonDefault && !Object.keys(h).some((k) => k.toLowerCase() === "content-type")) {
+            h["content-type"] = "application/json";
+          }
+          const r = await fetch(url as string, {
+            method: method as string,
+            headers: h,
+            body: (bodyStr as string | undefined) ?? undefined,
+            credentials: "include",
+          });
+          return {
+            status: r.status,
+            body: await r.text(),
+            contentType: r.headers.get("content-type") ?? "application/json",
+          };
+        },
+        [step.url, method, bodyStr, step.headers ?? {}, jsonDefault] as const,
+      );
+    }
+    // parseSessionSteps guarantees at least one step, so `last` is always set here.
+    return last as StepResult;
+  } finally {
+    await ctx.close();
+    release();
+  }
+}
+
+/** A fresh stealth browser context matching the caller's Accept-Language. Shared by the
+ *  single-shot render and the multi-step session flow so both present the same masked
+ *  browser fingerprint on the proxy's IP. */
+async function newStealthContext(req: Request): Promise<BrowserContext> {
   const browser = await getBrowser();
   // Honor the caller's Accept-Language so the rendered page — and its navigator.languages
   // tell — matches what a direct fetch would send; fall back to the German default. Only
@@ -458,6 +573,9 @@ async function renderStealthInner(
     timezoneId: "Europe/Berlin",
     viewport: { width: 1440, height: 900 },
     userAgent: CHROME_UA,
+    // Tolerate incomplete certificate chains, matching the plain-fetch path's
+    // tls:{rejectUnauthorized:false} — some archive hosts serve a partial chain.
+    ignoreHTTPSErrors: true,
   });
   await ctx.addInitScript((languages: string[]) => {
     Object.defineProperty(navigator, "webdriver", { get: () => undefined });
@@ -465,6 +583,16 @@ async function renderStealthInner(
     Object.defineProperty(navigator, "plugins", { get: () => [1, 2, 3, 4, 5] });
     (window as unknown as { chrome: unknown }).chrome = { runtime: {} };
   }, lang.languages);
+  return ctx;
+}
+
+async function renderStealthInner(
+  url: string,
+  req: Request,
+  waitMs: number,
+  block: boolean,
+): Promise<{ status: number; body: string; contentType: string }> {
+  const ctx = await newStealthContext(req);
   const page = await ctx.newPage();
   await enableBlocking(page, block);
   try {

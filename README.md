@@ -95,6 +95,18 @@ like `Cookie` to every subresource origin.
 - `?solve=1` — force the FlareSolverr path even when the cheap CF heuristic doesn't fire (e.g. a large 403 page rendered inside the site's own shell with no `cf-chl_` markers).
 - `?render=1` — return the page rendered by a stealth headless Chromium (masks `navigator.webdriver`, `window.chrome`, plugins, etc.). For JS-rendered SPAs that serve a bot-fallback to anything headless-looking. Keeps the browser on the proxy's IP so callers need no browser of their own.
 - `?wait=<ms>` — with `render=1`, how long to let the SPA's XHR content settle (default `6000`, max `30000`).
+- `?session=1` — **multi-step session**. `POST` a JSON array of steps `[{url,method,body,headers}, …]`; they run in order inside **one** stealth browser context (issued as in-page `fetch()`, so Chromium's cookie jar carries the server-side session across steps), on the proxy's IP. The **last** step's response is returned. For stateful search backends where one request registers a query in a session and a second reads it back — which a stateless single fetch can't bridge. Each step's `body` may be a JSON object/array (serialized, `content-type: application/json` defaulted) or a raw string (sent verbatim). The top-level `?url=` is only a log label. Example:
+
+```
+POST /?url=https://collections.example.org&session=1
+Authorization: Bearer <AUTH_TOKEN>
+Content-Type: application/json
+
+[
+  { "url": "https://collections.example.org/api/BuildQuery", "method": "POST", "body": { "query": "Weiss" } },
+  { "url": "https://collections.example.org/api/GetResults?page=1", "method": "POST", "body": { "filters": [] } }
+]
+```
 - `?auto=1` — **auto-escalate** when a response looks blocked: plain fetch → FlareSolverr → stealth render, returning the first tier that isn't blocked (falls back to the real upstream response if none succeed). "Blocked" = a `403`/`429`/`503`, or a small page matching a known anti-bot wall (Cloudflare, Akamai, PerimeterX, Incapsula, captcha/JS walls). Set `AUTO_FALLBACK=1` to make this the default and use `?auto=0` to opt out per request.
 - `?block=0` — disable **ad/cookie/tracker blocking** for this render. On by default: rendered pages run through [`@ghostery/adblocker-playwright`](https://github.com/ghostery/adblocker) with uBO-style filter lists (cookie-banner annoyances + ads + tracking), which removes most consent banners at the source and makes renders faster/cleaner. Only affects `render` (the plain-fetch and FlareSolverr paths can't run a blocker). Configure lists via `ADBLOCK_LISTS`, disable globally via `ADBLOCK=0`.
 - `?format=md` — return the page as **Markdown** instead of raw HTML. [Readability](https://github.com/mozilla/readability) extracts the main article (dropping nav/ads/boilerplate and cookie-consent/CMP banners so they aren't mistaken for the content), then [Turndown](https://github.com/mixmark-io/turndown) (+ GFM tables) converts it, with relative links/images resolved to absolute URLs. Composes with `render=1` and the FlareSolverr fallback — whatever HTML the proxy obtains is converted. Non-HTML responses (JSON, images, downloads) pass through untouched. Returns `content-type: text/markdown`.
