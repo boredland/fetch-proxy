@@ -7,8 +7,12 @@ import { NodeHtmlMarkdown } from "node-html-markdown";
 // failure mode on app shells like Elmhurst), and ships GFM (tables/strikethrough).
 const nhm = new NodeHtmlMarkdown({ bulletMarker: "-", codeFence: "```", codeBlockStyle: "fenced" });
 
-// Even so, skip the no-article full-body fallback above this size: converting a
-// whole rendered app shell is slow and pointless — bail to raw HTML instead.
+// Even so, skip the *implicit* no-article full-body fallback above this size:
+// converting a whole rendered app shell is slow and pointless — bail to raw HTML
+// instead. It does not apply when the caller asks for the body deliberately
+// (`readability=0`): there the whole body IS the requested answer, and a real
+// content page can exceed this — royalballetschool.org.uk serves 497 KB of
+// WordPress markup that converts fine.
 const MAX_FALLBACK_HTML = 200_000;
 
 // Exact containers for the common Consent Management Platforms. Removing the whole
@@ -52,8 +56,18 @@ function stripConsent(document: Document): void {
  *  article (dropping nav/ads/boilerplate); if the page isn't article-shaped it
  *  falls back to converting the whole body. A `<base>` tag is injected first so
  *  Readability resolves relative links/images to absolute URLs, and cookie-consent
- *  banners are stripped so they don't get mistaken for the main content. */
-export function htmlToMarkdown(html: string, baseUrl: string): string {
+ *  banners are stripped so they don't get mistaken for the main content.
+ *
+ *  Pass `readability: false` to skip the article extraction and convert the whole
+ *  (consent/script-stripped) body. Readability optimises for *prose*, so on a
+ *  listing-shaped page it succeeds and returns only the description — dropping the
+ *  dates, prices and tables around it. Measured on staatsballett-berlin.de, the
+ *  article is 734 bytes and contains neither of the event's two dates, which are
+ *  the whole point of the page; orsolina28.it loses both dates, all three prices
+ *  and the age range. Those pages are not broken, they are simply not articles,
+ *  and no heuristic here can tell "boilerplate" from "the facts the caller came
+ *  for". The body mode is still ~10x smaller than the raw HTML. */
+export function htmlToMarkdown(html: string, baseUrl: string, readability = true): string {
   const withBase = /<base[\s>]/i.test(html)
     ? html
     : html.replace(/<head[^>]*>/i, (head) => `${head}<base href="${baseUrl}">`);
@@ -73,18 +87,30 @@ export function htmlToMarkdown(html: string, baseUrl: string): string {
 
   let title = "";
   let articleHtml: string | undefined;
-  try {
-    const article = new Readability(document).parse();
-    if (article?.content) {
-      articleHtml = article.content;
-      title = article.title?.trim() ?? "";
+  if (readability) {
+    try {
+      const article = new Readability(document).parse();
+      if (article?.content) {
+        articleHtml = article.content;
+        title = article.title?.trim() ?? "";
+      }
+    } catch {
+      // Non-article page — fall back below.
     }
-  } catch {
-    // Non-article page — fall back below.
+  } else {
+    // The caller wants the body, but the <title> is still the page's own name and
+    // Readability is what used to supply it.
+    title = document.querySelector("title")?.textContent?.trim() ?? "";
   }
 
   let contentHtml = articleHtml;
   if (contentHtml === undefined) {
+    // An explicit body request is not a fallback: the caller chose this, so the
+    // size bail-out below does not apply to it.
+    if (!readability) {
+      const md = nhm.translate(fallbackBody).trim();
+      return title ? `# ${title}\n\n${md}\n` : `${md}\n`;
+    }
     // Readability found no article. Converting a whole rendered body is the slow,
     // stack-blowing path (Turndown recurses per node) and pointless on an app
     // shell — bail so the caller serves the raw HTML instead of hanging.

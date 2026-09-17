@@ -115,6 +115,7 @@ function buildResponse(
   contentType: string,
   wantMd: boolean,
   url: string,
+  readability = true,
 ): Response {
   if (wantMd && /html/i.test(contentType)) {
     const html = typeof body === "string" ? body : body.toString("utf8");
@@ -122,7 +123,7 @@ function buildResponse(
     // JS-rendered page (Turndown recurses per node and overflows the stack on a
     // deep app shell). Degrade to the raw HTML rather than failing the request.
     try {
-      return new Response(htmlToMarkdown(html, url), {
+      return new Response(htmlToMarkdown(html, url, readability), {
         status,
         headers: { "content-type": "text/markdown; charset=utf-8" },
       });
@@ -175,6 +176,15 @@ const ProxyQuery = t.Object({
       description:
         'Set to "md" to convert the fetched HTML to Markdown (Readability main-content extraction; nav/ads dropped, links absolutized).',
       examples: ["md"],
+    }),
+  ),
+  readability: t.Optional(
+    t.String({
+      description:
+        'With format=md, set to "0" to skip Readability and convert the whole body (minus scripts/styles/consent banners). ' +
+        "Use it for listing-shaped pages — event calendars, course tables, price lists — where Readability keeps the prose " +
+        "and drops the dates and figures around it. Larger output, but still far smaller than the raw HTML.",
+      examples: ["0"],
     }),
   ),
   auto: t.Optional(
@@ -302,6 +312,9 @@ async function runProxy(
   // `format=md` converts whatever HTML we end up with (direct, FlareSolverr, or
   // rendered) into Markdown — see buildResponse.
   const wantMd = query.format === "md";
+  // Opt out of Readability's main-content extraction for this request; only
+  // meaningful together with format=md.
+  const readability = query.readability !== "0";
   // Auto-escalation: on by default if AUTO_FALLBACK is set, unless `?auto=0`; or
   // opt in per-request with `?auto=1`.
   const auto = query.auto === "1" || (AUTO_FALLBACK && query.auto !== "0");
@@ -314,7 +327,7 @@ async function runProxy(
       const waitMs = Math.min(Number(query.wait) || 6000, 30000);
       const rendered = await renderStealth(url, req, waitMs, block);
       console.log(`<- ${rendered.status} ${url} (render)`);
-      return buildResponse(rendered.status, rendered.body, rendered.contentType, wantMd, url);
+      return buildResponse(rendered.status, rendered.body, rendered.contentType, wantMd, url, readability);
     } catch (e) {
       console.error(`!! render ${url}: ${errMessage(e)}`);
       return Response.json({ error: errMessage(e) }, { status: 502 });
@@ -330,7 +343,7 @@ async function runProxy(
       const steps = parseSessionSteps(body);
       const result = await runSession(req, steps, signal);
       console.log(`<- ${result.status} ${url} (session, ${steps.length} steps)`);
-      return buildResponse(result.status, result.body, result.contentType, wantMd, url);
+      return buildResponse(result.status, result.body, result.contentType, wantMd, url, readability);
     } catch (e) {
       console.error(`!! session ${url}: ${errMessage(e)}`);
       return Response.json({ error: errMessage(e) }, { status: 502 });
@@ -387,7 +400,7 @@ async function runProxy(
         best = { status: solved.status, body: solved.body, contentType: "text/html; charset=utf-8" };
         if (!looksBlocked(solved.status, asBuffer(solved.body))) {
           console.log(`<- ${solved.status} ${url} (flaresolverr)`);
-          return buildResponse(best.status, best.body, best.contentType, wantMd, url);
+          return buildResponse(best.status, best.body, best.contentType, wantMd, url, readability);
         }
         console.warn(`!! FlareSolverr still blocked ${url}`);
       } else {
@@ -403,7 +416,7 @@ async function runProxy(
         const rendered = await renderStealth(url, req, 6000, block);
         if (!looksBlocked(rendered.status, asBuffer(rendered.body))) {
           console.log(`<- ${rendered.status} ${url} (auto render)`);
-          return buildResponse(rendered.status, rendered.body, rendered.contentType, wantMd, url);
+          return buildResponse(rendered.status, rendered.body, rendered.contentType, wantMd, url, readability);
         }
         console.warn(`!! stealth render still blocked ${url}`);
       } catch (e) {
@@ -412,7 +425,7 @@ async function runProxy(
     }
 
     console.log(`<- ${best.status} ${url}`);
-    return buildResponse(best.status, best.body, best.contentType, wantMd, url);
+    return buildResponse(best.status, best.body, best.contentType, wantMd, url, readability);
   } catch (e) {
     console.error(`!! ${url}: ${errMessage(e)}`);
     return Response.json({ error: errMessage(e) }, { status: 502 });
