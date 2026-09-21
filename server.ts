@@ -94,16 +94,27 @@ function parseAcceptLanguage(header: string | null): { locale: string; languages
 // response is worth escalating past.
 const BOT_WALL =
   /just a moment|attention required|cf-chl|__cf_chl|access denied|pardon our interruption|enable javascript (and cookies|to continue)|request unsuccessful\. incapsula|are you (a )?human|verify you are (a )?human|unusual traffic|please verify you|recaptcha|hcaptcha/i;
+// Statuses that are a block on their own, no body inspection needed. 401 is here
+// because some origins refuse the proxy's egress with it rather than a 403 —
+// elmhurstballetschool.org does exactly that, and without it such a host never
+// escalated at all. A 404 is a real answer, not a block, so it is absent.
+const BLOCK_STATUS: Record<number, true> = { 401: true, 403: true, 429: true, 503: true };
+// Generic vendor markers are ordinary English ("access denied", "recaptcha") that a
+// real article can legitimately contain, so they only count on a body small enough
+// to be an interstitial. This cap is what keeps prose from escalating.
+const BOT_WALL_MAX_BYTES = 50_000;
 
 /** Heuristic for "this response is a block/challenge, not the real page" — drives
- *  auto-escalation. Conservative on purpose: hard block statuses always count, and
- *  vendor wall markers only count on a small body (real content pages that merely
- *  mention "captcha" are large and pass through). A 404 is a real answer, not a
- *  block, so it does not escalate. */
-function looksBlocked(status: number, body: Buffer): boolean {
-  if (status === 403 || status === 429 || status === 503) return true;
-  if (body.length > 50_000) return false;
-  return BOT_WALL.test(body.subarray(0, 16_384).toString("utf8"));
+ *  auto-escalation. Conservative on purpose: hard block statuses always count;
+ *  generic vendor wording only counts on a small body; and the CF-internal markers
+ *  count at any size up to CF_CHALLENGE_MAX_BYTES, because the managed-challenge
+ *  page is ~90KB+ with its marker at the very end and is unambiguously a challenge
+ *  wherever it appears (an earlier 16KB head window missed it entirely). */
+export function looksBlocked(status: number, body: Buffer): boolean {
+  if (BLOCK_STATUS[status]) return true;
+  if (body.length <= CF_CHALLENGE_MAX_BYTES && CF_CHALLENGE.test(body.toString("utf8"))) return true;
+  if (body.length > BOT_WALL_MAX_BYTES) return false;
+  return BOT_WALL.test(body.toString("utf8"));
 }
 
 /** Build the upstream passthrough response, converting to Markdown when the
@@ -259,12 +270,16 @@ const app = new Elysia()
             },
           },
         ),
-  )
-  .listen({ port: PORT, idleTimeout: 180 }, (server) => {
+  );
+
+// Importing this module (tests) must not bind a port — only bind when run directly.
+if (import.meta.main) {
+  app.listen({ port: PORT, idleTimeout: 180 }, (server) => {
     console.log(`fetch-proxy listening on :${server.port}`);
     console.log(`scalar docs at http://localhost:${server.port}/docs`);
     if (FLARESOLVERR_URL) console.log(`flaresolverr sidecar: ${FLARESOLVERR_URL}`);
   });
+}
 
 // A single malformed upstream (e.g. Playwright choking on a bad Set-Cookie during a
 // browser fetch) must never take the whole proxy down — log and keep serving.
