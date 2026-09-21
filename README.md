@@ -6,7 +6,42 @@ Built on [Bun](https://bun.com) + [Elysia](https://elysiajs.com), with an intera
 
 ## Running
 
-### Plain proxy only (no CF-challenge support)
+### From the published image (no build)
+
+Every push to `main` publishes a **public** image to GHCR, so nothing needs to
+build this repo to run it:
+
+```bash
+docker run -p 3000:3000 -e AUTH_TOKEN=your-secret ghcr.io/boredland/fetch-proxy:latest
+```
+
+That also makes it usable as a GitHub Actions **service container**, which is
+what the image exists for — a `services:` block can only pull an image, never
+build one from a Dockerfile, so the alternative is vendoring this source into
+every consumer:
+
+```yaml
+services:
+  fetch-proxy:
+    image: ghcr.io/boredland/fetch-proxy:sha-1b3cb99
+    env:
+      AUTH_TOKEN: ci-local
+    options: >-
+      --health-cmd "curl -fsS -o /dev/null http://127.0.0.1:3000/docs || exit 1"
+      --health-interval 5s --health-retries 12
+```
+
+**Pin `sha-<short>`, not `latest`** — a pipeline that follows `latest` changes
+behaviour whenever this repo does, with no diff on its own side. `latest` is for
+humans and `docker run`.
+
+The package is public, so a consumer needs no registry login. Each published tag
+is smoke-tested by the workflow that publishes it: it must refuse an
+unauthenticated request with `401` **and** return the real target page for an
+authenticated one, so a broken image fails here rather than in a consumer's
+pipeline one repository away.
+
+### Build it yourself
 
 ```bash
 docker build -t fetch-proxy .

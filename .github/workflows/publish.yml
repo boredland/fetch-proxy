@@ -1,0 +1,117 @@
+name: publish
+
+# Publish the proxy image so callers can run it as a CI **service container**
+# instead of vendoring the source and building it themselves.
+#
+# The consumer this exists for is `intensive-dance/intensive-dance`, whose scrape
+# needs the proxy on the runner's own egress. A GitHub Actions `services:` block
+# can only PULL an image — it cannot build one from a Dockerfile — so without a
+# published image the consumer's only options are to vendor this source (a copy
+# that silently diverges) or to shell out to `docker build` in a step (which then
+# owns readiness and cleanup by hand). Both were tried; this replaces them.
+#
+# The package is PUBLIC, which is the property that makes it worth doing: a
+# public GHCR image needs no registry login in the consumer, so its workflow
+# drops the auth, the build, the readiness probe and the teardown all at once.
+on:
+  push:
+    branches: [main]
+    # Docs-only pushes do not change the image. `paths-ignore` rather than an
+    # allowlist: a new source file must publish by default, and forgetting to add
+    # it to a list would silently freeze the published image at the last build.
+    paths-ignore:
+      - "**.md"
+      - "docker-compose.yml"
+  pull_request:
+    paths-ignore:
+      - "**.md"
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: ${{ github.repository }}
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # The only write this job needs. `contents` stays read: it publishes a
+      # package, it never pushes a commit or a tag.
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # A pull request builds but does not push — the image is only published
+      # from `main`, so a fork or an unreviewed branch can never overwrite the
+      # tag a consumer pins. The build still runs, so a Dockerfile that no longer
+      # builds fails the PR rather than the next push to main.
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE }}
+          # `sha-<short>` is the tag a consumer should PIN: it names one build,
+          # so a proxy change cannot silently alter a consumer's behaviour with
+          # no diff on their side. `latest` is a convenience for humans and for
+          # `docker run`, never something a pipeline should depend on.
+          tags: |
+            type=sha,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # The Playwright base is ~2.5 GB and changes rarely, so without a cache
+          # every run re-pulls and re-exports it. GHA cache is the right backend
+          # here (unlike on the consumer's self-hosted runners, where a host
+          # mount is cheaper) because these runners are ephemeral.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # A published image nobody can start is worse than no image: the failure
+      # would surface in the consumer's pipeline, as a service container that
+      # never becomes healthy, with the cause one repository away. So the tag is
+      # smoke-tested here, by the job that published it.
+      - name: Smoke-test the published image
+        if: github.event_name != 'pull_request'
+        run: |
+          tag=$(echo "${{ steps.meta.outputs.tags }}" | head -1)
+          docker run -d --name smoke -p 3000:3000 -e AUTH_TOKEN=smoke "$tag"
+          for attempt in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 http://127.0.0.1:3000/ || true)
+            # An UNAUTHENTICATED request must be refused. That proves two things a
+            # `/docs` probe cannot: the server is serving, and the auth guard is
+            # actually wired — a 200 here would mean the published image is an
+            # open relay.
+            [ "$code" = "401" ] && break
+            sleep 1
+          done
+          if [ "$code" != "401" ]; then
+            echo "image did not come up refusing unauthenticated calls (last: ${code:-none})" >&2
+            docker logs smoke >&2 || true
+            exit 1
+          fi
+          body=$(curl -fsS --max-time 30 -H 'Authorization: Bearer smoke' \
+            "http://127.0.0.1:3000/?url=https%3A%2F%2Fexample.com")
+          # And that it actually FETCHES, not merely that it answers: a proxy
+          # that returns its own error page with a 200 would pass a status check.
+          echo "$body" | grep -qi "example domain" || {
+            echo "authenticated fetch did not return the target page" >&2
+            echo "$body" | head -20 >&2
+            exit 1
+          }
+          docker rm -f smoke
+          echo "published $tag — auth wall up, fetch works"
